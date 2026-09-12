@@ -89,6 +89,7 @@ def test_logical_rep_auth_query(bouncer):
 
 
 def test_logical_rep_unprivileged(bouncer):
+    bouncer.admin("set server_login_retry = 60")
     if PG_MAJOR_VERSION < 10:
         expected_log = "no pg_hba.conf entry for replication connection"
     elif PG_MAJOR_VERSION < 16:
@@ -101,6 +102,9 @@ def test_logical_rep_unprivileged(bouncer):
 
     assert expected_log in error["M"]
     assert error["C"] == ("28000" if PG_MAJOR_VERSION < 10 else "42501")
+
+    # This role can still open ordinary connections in the same pool.
+    bouncer.test()
 
 
 def test_logical_rep_non_existing_database(bouncer):
@@ -119,6 +123,88 @@ def test_replication_startup_long_error(bouncer, replication):
     )
     assert error["C"] == "22023"
     assert error["M"] == f'invalid value for parameter "work_mem": "{value}"'
+
+
+@pytest.mark.parametrize("replication", ["database", "yes"])
+@pytest.mark.parametrize("cached_welcome", [False, True])
+def test_replication_startup_errors_are_independent(
+    bouncer, replication, cached_welcome
+):
+    bouncer.admin("set server_login_retry = 60")
+    if cached_welcome:
+        bouncer.test(dbname="user_passthrough")
+        # Close the usable server without clearing the cached welcome message.
+        bouncer.admin("pause user_passthrough")
+        bouncer.admin("resume user_passthrough")
+
+    # A cached welcome makes this a query error rather than a connection error.
+    error_type = (
+        psycopg.errors.InvalidParameterValue
+        if cached_welcome
+        else psycopg.OperationalError
+    )
+    # A bad startup option must not delay another replication attempt, or
+    # leave an ordinary client with the previous replication client's error.
+    for _ in range(2):
+        with pytest.raises(error_type, match='invalid value for parameter "work_mem"'):
+            bouncer.test(
+                dbname="user_passthrough",
+                replication=replication,
+                options="-c work_mem=invalid",
+            )
+
+    bouncer.test(dbname="user_passthrough")
+    bouncer.sql("IDENTIFY_SYSTEM", dbname="user_passthrough", replication=replication)
+
+
+def test_replication_error_does_not_restart_pool_backoff(pg, bouncer):
+    bouncer.admin("set verbose = 1")
+    bouncer.admin("set server_login_retry = 2")
+    bouncer.admin("set server_tls_sslmode = disable")
+    pg.nossl_access("p0", "reject")
+    pg.reload()
+    with pytest.raises(
+        psycopg.OperationalError, match="pg_hba.conf rejects connection"
+    ):
+        bouncer.test(dbname="user_passthrough")
+
+    pg.reset_hba()
+    pg.reload()
+    time.sleep(2)
+
+    # The original pool-wide backoff has expired. A replication-specific
+    # failure must not restart its timer, even though the failure flag is set.
+    with pytest.raises(psycopg.OperationalError, match="invalid value for parameter"):
+        bouncer.test(
+            dbname="user_passthrough",
+            replication="database",
+            options="-c work_mem=invalid",
+        )
+
+    with bouncer.log_contains("last failed, not launching new connection yet", times=0):
+        bouncer.sql(
+            "IDENTIFY_SYSTEM", dbname="user_passthrough", replication="database"
+        )
+
+
+@pytest.mark.parametrize("replication", ["database", "yes"])
+def test_replication_startup_timeout_keeps_backoff(pg, bouncer, replication):
+    pg.configure("pre_auth_delay to '5s'")
+    pg.reload()
+    # Send the StartupMessage before the timeout, so that the backend is
+    # already marked as a replication connection when it is disconnected.
+    bouncer.admin("set server_tls_sslmode = disable")
+    bouncer.admin("set server_connect_timeout = 1")
+    bouncer.admin("set server_login_retry = 60")
+
+    with bouncer.log_contains("new connection to server", times=1):
+        with pytest.raises(psycopg.OperationalError, match="connect timeout"):
+            bouncer.test(dbname="user_passthrough", replication=replication)
+
+        # Transport failures still apply to the whole pool: do not launch a
+        # new backend for an ordinary client while the retry timer is active.
+        with pytest.raises(psycopg.OperationalError, match="timeout"):
+            bouncer.test(dbname="user_passthrough", connect_timeout=2)
 
 
 def test_replication_auth_query_error_hidden(bouncer):
@@ -256,12 +342,16 @@ def test_physical_rep(bouncer):
 
 
 def test_physcal_rep_unprivileged(bouncer):
+    bouncer.admin("set server_login_retry = 60")
     expected_error = "no pg_hba.conf entry for replication connection from host"
     with bouncer.log_contains(rf"closing because: .*{expected_error}.*\(age", times=2):
         error = _replication_startup_error(bouncer, database="p0", replication="yes")
 
     assert expected_error in error["M"]
     assert error["C"] == "28000"
+
+    # The replication-specific HBA rule must not block ordinary connections.
+    bouncer.test()
 
 
 @pytest.mark.skipif("PG_MAJOR_VERSION < 10", reason="pg_receivewal was added in PG10")

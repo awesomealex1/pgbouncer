@@ -1342,7 +1342,7 @@ static void unlink_server(PgSocket *server, const char *sqlstate, const char *re
  * The latter is for protocol and communication errors where a normal
  * protocol termination is not possible.
  */
-void disconnect_server_sqlstate(PgSocket *server, bool send_term, const char *sqlstate, const char *reason)
+static void disconnect_server_internal(PgSocket *server, bool send_term, const char *sqlstate, const char *reason, bool error_response)
 {
 	usec_t now = get_cached_time();
 	struct List *cancel_item, *tmp;
@@ -1372,9 +1372,18 @@ void disconnect_server_sqlstate(PgSocket *server, bool send_term, const char *sq
 		 * except when sending cancel packet
 		 */
 		if (!server->ready) {
-			server->pool->last_login_failed = true;
-			server->pool->last_connect_failed = true;
-			safe_strcpy(server->pool->last_connect_failed_message, reason, sizeof(server->pool->last_connect_failed_message));
+			/*
+			 * A replication ErrorResponse can be specific to the linked
+			 * client, e.g. its permissions or startup options. Leave the
+			 * shared pool failure state alone for these errors. Transport
+			 * failures still need the usual pool-wide retry backoff.
+			 */
+			if (!server->replication || !error_response) {
+				server->pool->last_login_failed = true;
+				server->pool->last_connect_failed = true;
+				server->pool->last_connect_time = server->connect_time;
+				safe_strcpy(server->pool->last_connect_failed_message, reason, sizeof(server->pool->last_connect_failed_message));
+			}
 		} else {
 			/*
 			 * We did manage to connect and used the connection for query
@@ -1422,6 +1431,12 @@ void disconnect_server_sqlstate(PgSocket *server, bool send_term, const char *sq
 		log_noise("sbuf_close failed, retry later");
 }
 
+/* Disconnect after an upstream ErrorResponse, preserving its SQLSTATE/message. */
+void disconnect_server_sqlstate(PgSocket *server, bool send_term, const char *sqlstate, const char *reason)
+{
+	disconnect_server_internal(server, send_term, sqlstate, reason, true);
+}
+
 /* Format locally generated errors; upstream errors use the untruncated helper. */
 void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...)
 {
@@ -1435,7 +1450,7 @@ void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...
 	vsnprintf(buf, sizeof(buf), reason, ap);
 	va_end(ap);
 
-	disconnect_server_sqlstate(server, send_term, NULL, buf);
+	disconnect_server_internal(server, send_term, NULL, buf, false);
 }
 
 /*
@@ -1995,7 +2010,6 @@ force_new:
 	server->login_user_credentials = server->pool->user_credentials;
 	server->connect_time = get_cached_time();
 	statlist_init(&server->canceling_clients, "canceling_clients");
-	pool->last_connect_time = get_cached_time();
 	pool->last_active_time = get_cached_time();
 	change_server_state(server, SV_LOGIN);
 	pool->db->connection_count++;
