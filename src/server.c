@@ -122,7 +122,7 @@ const char * kill_pool_logins_server_error(PgPool *pool, PktHdr *errpkt)
 static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
 {
 	SBuf *sbuf = &server->sbuf;
-	const char *msg;
+	const char *level, *msg, *sqlstate;
 	bool res = false;
 	const uint8_t *ckey;
 
@@ -193,8 +193,13 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
 			msg = kill_pool_logins_server_error(server->pool, pkt);
 			disconnect_server(server, true, "%s", (char *)msg);
 		} else {
-			log_server_error("S: login failed", pkt);
-			disconnect_server(server, true, "login failed");
+			/* Preserve the upstream error for this replication pair only. */
+			parse_server_error(pkt, &level, &msg, &sqlstate);
+			if (level != NULL && msg != NULL)
+				log_error("S: login failed: %s: %s", level, msg);
+			else
+				log_error("S: login failed: partial error message, cannot log");
+			disconnect_server_sqlstate(server, true, sqlstate, msg ? msg : "login failed");
 		}
 		break;
 

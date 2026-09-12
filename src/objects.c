@@ -1312,7 +1312,7 @@ bool release_server(PgSocket *server)
 	return true;
 }
 
-static void unlink_server(PgSocket *server, const char *reason)
+static void unlink_server(PgSocket *server, const char *sqlstate, const char *reason)
 {
 	PgSocket *client;
 	if (!server->link)
@@ -1327,7 +1327,7 @@ static void unlink_server(PgSocket *server, const char *reason)
 	 * logged in, otherwise send generic message.
 	 */
 	if (client->state == CL_ACTIVE || client->state == CL_WAITING)
-		disconnect_client(client, true, "%s", reason);
+		disconnect_client_sqlstate(client, true, sqlstate, reason);
 	else if (client->state == CL_ACTIVE_CANCEL)
 		disconnect_client(client, false, "successfully sent cancel request");
 	else
@@ -1342,21 +1342,14 @@ static void unlink_server(PgSocket *server, const char *reason)
  * The latter is for protocol and communication errors where a normal
  * protocol termination is not possible.
  */
-void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...)
+void disconnect_server_sqlstate(PgSocket *server, bool send_term, const char *sqlstate, const char *reason)
 {
 	usec_t now = get_cached_time();
-	char buf[128];
-	va_list ap;
 	struct List *cancel_item, *tmp;
 
 	if (server == NULL) {
 		return;
 	}
-
-	va_start(ap, reason);
-	vsnprintf(buf, sizeof(buf), reason, ap);
-	va_end(ap);
-	reason = buf;
 
 	if (cf_log_disconnections) {
 		slog_info(server, "closing because: %s (age=%" PRIu64 "s)", reason,
@@ -1366,7 +1359,7 @@ void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...
 	switch (server->state) {
 	case SV_ACTIVE_CANCEL:
 	case SV_ACTIVE:
-		unlink_server(server, reason);
+		unlink_server(server, sqlstate, reason);
 		break;
 	case SV_TESTED:
 	case SV_USED:
@@ -1382,8 +1375,7 @@ void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...
 			server->pool->last_login_failed = true;
 			server->pool->last_connect_failed = true;
 			safe_strcpy(server->pool->last_connect_failed_message, reason, sizeof(server->pool->last_connect_failed_message));
-		} else
-		{
+		} else {
 			/*
 			 * We did manage to connect and used the connection for query
 			 * cancellation, so to the best of our knowledge we can connect to
@@ -1393,7 +1385,7 @@ void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...
 			send_term = false;
 		}
 		if (server->replication)
-			unlink_server(server, reason);
+			unlink_server(server, sqlstate, reason);
 		break;
 	default:
 		fatal("bad server state: %d, %s", server->state, reason);
@@ -1428,6 +1420,22 @@ void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...
 	change_server_state(server, SV_JUSTFREE);
 	if (!sbuf_close(&server->sbuf))
 		log_noise("sbuf_close failed, retry later");
+}
+
+/* Format locally generated errors; upstream errors use the untruncated helper. */
+void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...)
+{
+	char buf[128];
+	va_list ap;
+
+	if (server == NULL)
+		return;
+
+	va_start(ap, reason);
+	vsnprintf(buf, sizeof(buf), reason, ap);
+	va_end(ap);
+
+	disconnect_server_sqlstate(server, send_term, NULL, buf);
 }
 
 /*

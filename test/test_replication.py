@@ -1,5 +1,6 @@
-import asyncio
 import signal
+import socket
+import struct
 import subprocess
 import time
 
@@ -9,6 +10,42 @@ import pytest
 from psycopg import sql
 
 from .utils import PG_MAJOR_VERSION, WINDOWS, run
+
+
+def _replication_startup_error(bouncer, **parameters):
+    # libpq does not expose the SQLSTATE of connection failures through psycopg.
+    # Read the wire response to check both the message and the SQLSTATE.
+    parameters.setdefault("user", bouncer.default_user)
+    parameters.setdefault("database", "user_passthrough")
+    parameters.setdefault("replication", "database")
+    encoded_parameters = b"".join(
+        key.encode() + b"\0" + value.encode() + b"\0"
+        for key, value in parameters.items()
+    )
+    payload = struct.pack("!I", 0x30000) + encoded_parameters + b"\0"
+
+    timeout = bouncer.set_default_connection_options({})["connect_timeout"]
+    with socket.create_connection(
+        (bouncer.host, bouncer.port), timeout=timeout
+    ) as sock:
+        sock.sendall(struct.pack("!I", len(payload) + 4) + payload)
+        with sock.makefile("rb") as stream:
+            while message_type := stream.read(1):
+                message_length = struct.unpack("!I", stream.read(4))[0]
+                message = stream.read(message_length - 4)
+                assert len(message) == message_length - 4
+                if message_type == b"E":
+                    error = {
+                        field[:1].decode(): field[1:].decode()
+                        for field in message.split(b"\0")
+                        if field
+                    }
+                    assert error["S"] == "FATAL"
+                    # Exactly one error, followed by connection closure.
+                    assert stream.read(1) == b""
+                    return error
+
+    pytest.fail("server closed the connection without an ErrorResponse")
 
 
 def test_logical_rep(bouncer):
@@ -59,14 +96,43 @@ def test_logical_rep_unprivileged(bouncer):
     else:
         expected_log = "permission denied to start WAL sender"
 
-    with (
-        bouncer.log_contains(
-            expected_log,
-        ),
-        bouncer.log_contains(r"closing because: login failed \(age", times=2),
-        pytest.raises(psycopg.OperationalError, match=r"login failed"),
-    ):
-        bouncer.sql("IDENTIFY_SYSTEM", replication="database")
+    with bouncer.log_contains(rf"closing because: .*{expected_log}.*\(age", times=2):
+        error = _replication_startup_error(bouncer, database="p0")
+
+    assert expected_log in error["M"]
+    assert error["C"] == ("28000" if PG_MAJOR_VERSION < 10 else "42501")
+
+
+def test_logical_rep_non_existing_database(bouncer):
+    error = _replication_startup_error(bouncer, database="non_existing_pg_db")
+    assert error["C"] == "3D000"
+    assert error["M"] == 'database "non_existing_pg_db" does not exist'
+
+
+@pytest.mark.parametrize("replication", ["database", "yes"])
+def test_replication_startup_long_error(bouncer, replication):
+    # Exercise the old 128-byte reason and 512-byte ErrorResponse limits, as
+    # well as startup errors that exceed the default 4096-byte pkt_buf.
+    value = "x" * 5000
+    error = _replication_startup_error(
+        bouncer, replication=replication, options=f"-c work_mem={value}"
+    )
+    assert error["C"] == "22023"
+    assert error["M"] == f'invalid value for parameter "work_mem": "{value}"'
+
+
+def test_replication_auth_query_error_hidden(bouncer):
+    # A replication client's auth_query still uses an ordinary server
+    # connection, before client authentication has completed.
+    bouncer.admin("set auth_query = 'SELECT * FROM no_such_auth_table'")
+    with bouncer.log_contains('relation "no_such_auth_table" does not exist'):
+        error = _replication_startup_error(
+            bouncer,
+            database="pauthz",
+            user="pswcheck_not_in_auth_file",
+        )
+
+    assert error == {"S": "FATAL", "C": "08P01", "M": "bouncer config error"}
 
 
 @pytest.mark.skipif(
@@ -190,14 +256,12 @@ def test_physical_rep(bouncer):
 
 
 def test_physcal_rep_unprivileged(bouncer):
-    with (
-        bouncer.log_contains(
-            r"no pg_hba.conf entry for replication connection from host"
-        ),
-        bouncer.log_contains(r"closing because: login failed \(age", times=2),
-        pytest.raises(psycopg.OperationalError, match=r"login failed"),
-    ):
-        bouncer.test(replication="yes")
+    expected_error = "no pg_hba.conf entry for replication connection from host"
+    with bouncer.log_contains(rf"closing because: .*{expected_error}.*\(age", times=2):
+        error = _replication_startup_error(bouncer, database="p0", replication="yes")
+
+    assert expected_error in error["M"]
+    assert error["C"] == "28000"
 
 
 @pytest.mark.skipif("PG_MAJOR_VERSION < 10", reason="pg_receivewal was added in PG10")

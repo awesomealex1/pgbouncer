@@ -259,19 +259,24 @@ bool process_pkt_callback(PgSocket *sk, struct MBuf *data,
  */
 bool send_pooler_error(PgSocket *client, bool send_ready, const char *sqlstate, bool level_fatal, const char *msg)
 {
-	uint8_t tmpbuf[512];
-	PktBuf buf;
+	PktBuf *buf;
+	bool res;
 
 	if (cf_log_pooler_errors)
 		slog_warning(client, "pooler error: %s", msg);
 
-	pktbuf_static(&buf, tmpbuf, sizeof(tmpbuf));
-	pktbuf_write_generic(&buf, PqMsg_ErrorResponse, "cscscsc",
+	/* Upstream error messages can exceed a fixed-size error packet buffer. */
+	buf = pktbuf_dynamic(512);
+	if (!buf)
+		return false;
+	pktbuf_write_generic(buf, PqMsg_ErrorResponse, "cscscsc",
 			     'S', level_fatal ? "FATAL" : "ERROR",
 			     'C', sqlstate ? sqlstate : "08P01", 'M', msg, 0);
 	if (send_ready)
-		pktbuf_write_ReadyForQuery(&buf);
-	return pktbuf_send_immediate(&buf, client);
+		pktbuf_write_ReadyForQuery(buf);
+	res = pktbuf_send_immediate(buf, client);
+	pktbuf_free(buf);
+	return res;
 }
 
 /*
